@@ -50,18 +50,35 @@ export MYSQL_DB=loadtest
 ### Langkah-langkah
 
 ```bash
-# 1. Siapkan schema + seed data (100 ribu baris)
+# 1. Validasi koneksi, privilege, dan konfigurasi server
+python3 mysql_load_test.py precheck --threads 16
+
+# 2. Siapkan schema + seed data (100 ribu baris)
 python3 mysql_load_test.py prepare --rows 100000
 
-# 2. Jalankan workload yang diinginkan
+# 3. Jalankan workload yang diinginkan
 python3 mysql_load_test.py read   --threads 32 --duration 60   # 100% SELECT
 python3 mysql_load_test.py write  --threads 16 --duration 60   # 100% INSERT
 python3 mysql_load_test.py update --threads 16 --duration 60   # 100% UPDATE
 python3 mysql_load_test.py mixed  --threads 16 --duration 60   # OLTP campuran
 
-# 3. Bersihkan
+# 4. Bersihkan
 python3 mysql_load_test.py cleanup
 ```
+
+### Apa yang dicek oleh `precheck`
+
+- Koneksi ke server + RTT handshake.
+- Versi MySQL dan `default_storage_engine`.
+- Variabel server penting: `max_connections`, `innodb_buffer_pool_size`,
+  `innodb_flush_log_at_trx_commit`, `sync_binlog`, `log_bin`, `slow_query_log`,
+  `general_log`, dll.
+- Privilege user (`SELECT`, `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, `INDEX`).
+- Kapasitas koneksi: `max_connections − used` vs `--threads`.
+- Apakah database & tabel test sudah ada (warning kalau akan ter-overwrite).
+- Round-trip latency `SELECT 1` (min / p50 / p95 / max).
+
+Exit code `0` jika semua OK / warning, `1` jika ada FAIL.
 
 ### Contoh output
 

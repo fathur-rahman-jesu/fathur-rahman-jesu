@@ -5,6 +5,7 @@ MySQL Performance / Load Test Script
 
 Script untuk melakukan performance test dan load test pada database MySQL.
 Mendukung beberapa mode test:
+  - precheck : validasi koneksi, privilege, konfigurasi server, dan kapasitas
   - prepare  : membuat schema + dataset awal
   - read     : workload SELECT (point query)
   - write    : workload INSERT
@@ -20,6 +21,7 @@ Statistik yang dihasilkan:
   - durasi total
 
 Usage:
+  python3 mysql_load_test.py precheck --threads 16
   python3 mysql_load_test.py prepare --rows 100000
   python3 mysql_load_test.py mixed --threads 16 --duration 60
   python3 mysql_load_test.py read   --threads 32 --duration 30
@@ -112,6 +114,225 @@ def ensure_database(cfg: DBConfig) -> None:
             )
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight validation
+# ---------------------------------------------------------------------------
+REQUIRED_PRIVS = {"SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "INDEX"}
+
+
+def _fmt_bytes(n: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    f = float(n)
+    for u in units:
+        if f < 1024 or u == units[-1]:
+            return f"{f:.2f} {u}"
+        f /= 1024
+    return f"{f:.2f} TB"
+
+
+def _ok(label: str, msg: str = "") -> None:
+    print(f"  [ OK ]  {label}" + (f"  -> {msg}" if msg else ""))
+
+
+def _warn(label: str, msg: str) -> None:
+    print(f"  [WARN]  {label}  -> {msg}")
+
+
+def _fail(label: str, msg: str) -> None:
+    print(f"  [FAIL]  {label}  -> {msg}")
+
+
+def precheck(cfg: DBConfig, planned_threads: int) -> int:
+    """
+    Validasi pre-flight sebelum load test.
+    Return 0 jika semua OK / hanya warning, 1 jika ada FAIL.
+    """
+    print("=" * 60)
+    print("  MySQL Pre-flight Check")
+    print("=" * 60)
+    print(f"  target  : {cfg.user}@{cfg.host}:{cfg.port}/{cfg.database}")
+    print(f"  threads : {planned_threads} (rencana)")
+    print("-" * 60)
+
+    fails = 0
+    warns = 0
+
+    # 1. Koneksi + RTT
+    try:
+        t0 = time.perf_counter()
+        conn = pymysql.connect(
+            host=cfg.host, port=cfg.port, user=cfg.user,
+            password=cfg.password, autocommit=True,
+            connect_timeout=10, charset="utf8mb4",
+        )
+        rtt_ms = (time.perf_counter() - t0) * 1000
+        _ok("Connect ke server", f"RTT handshake {rtt_ms:.1f} ms")
+        if rtt_ms > 50:
+            _warn("Latency client<->server tinggi",
+                  f"{rtt_ms:.1f} ms — hasil benchmark bisa didominasi network")
+            warns += 1
+    except Exception as e:
+        _fail("Connect ke server", str(e))
+        print("=" * 60)
+        return 1
+
+    try:
+        with conn.cursor() as cur:
+            # 2. Versi + engine
+            cur.execute("SELECT VERSION()")
+            version = cur.fetchone()[0]
+            _ok("MySQL version", version)
+
+            cur.execute("SHOW VARIABLES LIKE 'default_storage_engine'")
+            engine = cur.fetchone()[1]
+            if engine.lower() == "innodb":
+                _ok("default_storage_engine", engine)
+            else:
+                _warn("default_storage_engine", f"{engine} (umumnya pakai InnoDB)")
+                warns += 1
+
+            # 3. Konfigurasi yang relevan
+            interesting = [
+                "max_connections",
+                "innodb_buffer_pool_size",
+                "innodb_log_file_size",
+                "innodb_redo_log_capacity",
+                "innodb_flush_log_at_trx_commit",
+                "innodb_flush_method",
+                "innodb_io_capacity",
+                "innodb_io_capacity_max",
+                "sync_binlog",
+                "log_bin",
+                "slow_query_log",
+                "general_log",
+                "thread_cache_size",
+                "table_open_cache",
+            ]
+            vars_map = {}
+            for v in interesting:
+                cur.execute(f"SHOW VARIABLES LIKE '{v}'")
+                row = cur.fetchone()
+                if row:
+                    vars_map[v] = row[1]
+
+            print("-" * 60)
+            print("  Server variables:")
+            for k, v in vars_map.items():
+                pretty = v
+                if k in ("innodb_buffer_pool_size", "innodb_log_file_size",
+                         "innodb_redo_log_capacity") and v.isdigit():
+                    pretty = f"{v}  ({_fmt_bytes(int(v))})"
+                print(f"    {k:<35s} = {pretty}")
+            print("-" * 60)
+
+            # 4. max_connections vs planned threads
+            max_conn = int(vars_map.get("max_connections", "0") or 0)
+            cur.execute("SHOW STATUS LIKE 'Threads_connected'")
+            used = int(cur.fetchone()[1])
+            free = max_conn - used
+            label = f"max_connections={max_conn}, used={used}, free={free}"
+            need = planned_threads + 2  # +2 buffer (connect helper, etc.)
+            if max_conn == 0:
+                _warn("max_connections", "tidak terbaca")
+                warns += 1
+            elif free < need:
+                _fail("Kapasitas koneksi", f"{label} — butuh ~{need}")
+                fails += 1
+            else:
+                _ok("Kapasitas koneksi", label)
+
+            # 5. Warning konfigurasi yang sering bikin write lambat
+            if vars_map.get("innodb_flush_log_at_trx_commit") == "1":
+                _warn("innodb_flush_log_at_trx_commit=1",
+                      "mode ACID penuh — write akan terlihat lebih lambat (normal)")
+                warns += 1
+            if vars_map.get("sync_binlog") == "1" and vars_map.get("log_bin", "OFF").upper() != "OFF":
+                _warn("sync_binlog=1 + binlog ON",
+                      "fsync binlog setiap commit — write throughput lebih rendah")
+                warns += 1
+            if vars_map.get("general_log", "OFF").upper() == "ON":
+                _warn("general_log=ON",
+                      "mencatat semua query — matikan saat benchmark")
+                warns += 1
+            if vars_map.get("slow_query_log", "OFF").upper() == "ON":
+                _warn("slow_query_log=ON",
+                      "boleh saja, tapi sedikit menambah overhead")
+                warns += 1
+
+            # 6. Privilege
+            cur.execute("SHOW GRANTS FOR CURRENT_USER()")
+            grants = " ".join(row[0].upper() for row in cur.fetchall())
+            if "ALL PRIVILEGES" in grants:
+                _ok("Privilege user", "ALL PRIVILEGES")
+            else:
+                missing = [p for p in REQUIRED_PRIVS if p not in grants]
+                if missing:
+                    _fail("Privilege user", f"kurang: {', '.join(sorted(missing))}")
+                    fails += 1
+                else:
+                    _ok("Privilege user",
+                        f"punya {', '.join(sorted(REQUIRED_PRIVS))}")
+
+            # 7. Database target
+            try:
+                cur.execute(
+                    "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA "
+                    "WHERE SCHEMA_NAME = %s", (cfg.database,))
+                if cur.fetchone():
+                    _ok("Database target ada", cfg.database)
+                else:
+                    _warn("Database target belum ada",
+                          f"`{cfg.database}` akan dibuat saat prepare")
+                    warns += 1
+            except Exception as e:
+                _warn("Cek database target", str(e))
+                warns += 1
+
+            # 8. Tabel test
+            try:
+                cur.execute(
+                    "SELECT TABLE_ROWS FROM information_schema.TABLES "
+                    "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s",
+                    (cfg.database, TABLE_NAME))
+                row = cur.fetchone()
+                if row is None:
+                    _ok("Tabel test", f"`{TABLE_NAME}` belum ada (akan dibuat oleh prepare)")
+                else:
+                    _warn(f"Tabel `{TABLE_NAME}` sudah ada",
+                          f"~{row[0]} baris — akan di-DROP oleh `prepare`")
+                    warns += 1
+            except Exception as e:
+                _warn("Cek tabel test", str(e))
+                warns += 1
+
+            # 9. Round-trip query latency (SELECT 1)
+            samples = []
+            for _ in range(20):
+                t0 = time.perf_counter()
+                cur.execute("SELECT 1")
+                cur.fetchall()
+                samples.append((time.perf_counter() - t0) * 1000)
+            samples.sort()
+            _ok("Round-trip SELECT 1",
+                f"min={samples[0]:.2f}ms  "
+                f"p50={percentile(samples, 0.50):.2f}ms  "
+                f"p95={percentile(samples, 0.95):.2f}ms  "
+                f"max={samples[-1]:.2f}ms")
+
+    finally:
+        conn.close()
+
+    print("-" * 60)
+    if fails:
+        print(f"  RESULT: {fails} FAIL, {warns} WARN — perbaiki dulu sebelum load test.")
+    elif warns:
+        print(f"  RESULT: OK dengan {warns} warning(s) — boleh lanjut, perhatikan catatan di atas.")
+    else:
+        print("  RESULT: semua check OK. Siap load test.")
+    print("=" * 60)
+    return 1 if fails else 0
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +679,11 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    p_check = sub.add_parser("precheck", help="Validasi pre-flight (koneksi, privilege, konfigurasi)")
+    add_conn_args(p_check)
+    p_check.add_argument("--threads", type=int, default=8,
+                         help="Jumlah thread yang akan dipakai (untuk cek max_connections)")
+
     p_prep = sub.add_parser("prepare", help="Buat schema + seed data")
     add_conn_args(p_prep)
     p_prep.add_argument("--rows", type=int, default=100_000, help="Jumlah baris awal (default 100000)")
@@ -482,7 +708,9 @@ def main() -> None:
     cfg = DBConfig.from_args(args)
 
     try:
-        if args.command == "prepare":
+        if args.command == "precheck":
+            sys.exit(precheck(cfg, planned_threads=args.threads))
+        elif args.command == "prepare":
             prepare(cfg, rows=args.rows, batch_size=args.batch_size)
         elif args.command == "cleanup":
             cleanup(cfg)
