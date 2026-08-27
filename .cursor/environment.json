@@ -1,0 +1,6 @@
+{
+  "name": "MySQL Load Test Toolkit",
+  "install": "bash scripts/cloud-agent-install.sh",
+  "start": "bash scripts/cloud-agent-start.sh",
+  "ports": [3306]
+}
