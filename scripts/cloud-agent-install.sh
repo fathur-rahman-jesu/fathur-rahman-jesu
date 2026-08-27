@@ -19,6 +19,10 @@ if [[ ! -d .venv ]]; then
 fi
 
 .venv/bin/pip install --upgrade pip
-.venv/bin/pip install -r requirements.txt
+if [[ -f requirements.txt ]]; then
+  .venv/bin/pip install -r requirements.txt
+else
+  .venv/bin/pip install 'PyMySQL>=1.1.0'
+fi
 
 echo "cloud-agent-install: done"
